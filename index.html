@@ -416,6 +416,72 @@
     return (today()-d)/86400000 >= 14;
   }
 
+  /* ---------- adaptive math difficulty (follows the child, not the birthday) ----------
+     kid.mathStep = integer rung on a ladder. Seeded from age, then it moves on its own
+     toward the ~85%-correct sweet spot: easy+fast -> up (with hysteresis); struggling -> down (gently).
+     Parents can also nudge it by hand. Only TALFAKTA/BLANDET first-attempt results drive it. */
+  var MATH_STEPS=[
+    {key:"pm10",   name:"Plus/minus op til 10"},
+    {key:"pm20",   name:"Plus/minus op til 20"},
+    {key:"pm100",  name:"Plus/minus op til 100"},
+    {key:"carry",  name:"Plus/minus med tier-overgang"},
+    {key:"tables", name:"Tabeller (gange)"},
+    {key:"divide", name:"Gange og division"},
+    {key:"k1000",  name:"Større tal (op til 1000)"},
+    {key:"twostep",name:"To-trins og manglende tal"},
+    {key:"depth",  name:"Halvdelen, dobbelt og store gange"}
+  ];
+  var MATH_STEP_MAX=MATH_STEPS.length-1;
+  function seedMathStep(age){ return (parseInt(age,10)||7) >= 9 ? 3 : 1; }
+  function mathStepOf(kid){
+    var s=(kid&&typeof kid.mathStep==="number")?kid.mathStep:seedMathStep(kid&&kid.age);
+    return Math.max(0,Math.min(MATH_STEP_MAX,s));
+  }
+  function mathStepName(kid){ return MATH_STEPS[mathStepOf(kid)].name; }
+  function setMathStep(kid,s){ kid.mathStep=Math.max(0,Math.min(MATH_STEP_MAX,s)); kid.mathUp=0; kid.mathPerf=[]; save(); render(); }
+  function logMathPerf(kid,ok,ms){
+    if(!Array.isArray(kid.mathPerf)) kid.mathPerf=[];
+    kid.mathPerf.push({ok:!!ok, ms:ms, step:mathStepOf(kid)});
+    if(kid.mathPerf.length>20) kid.mathPerf=kid.mathPerf.slice(-20);
+  }
+  // Returns "up" | "down" | null. Call after a talfakta session.
+  function adjustMathStep(kid){
+    var step=mathStepOf(kid); kid.mathStep=step; // make numeric value explicit/persisted
+    var atStep=(kid.mathPerf||[]).filter(function(r){ return r.step===step; });
+    if(atStep.length<10) return null;               // need a solid window before moving
+    var recent=atStep.slice(-16);
+    var acc=recent.reduce(function(s,r){ return s+(r.ok?1:0); },0)/recent.length;
+    var times=recent.map(function(r){ return r.ms; }).sort(function(a,b){ return a-b; });
+    var med=times[Math.floor(times.length/2)];
+    var target= step<=2 ? 7000 : step<=4 ? 9000 : 12000; // looser speed target as it gets harder
+    if(acc>=0.90 && med<=target){
+      kid.mathUp=(kid.mathUp||0)+1;
+      if(kid.mathUp>=2 && step<MATH_STEP_MAX){ kid.mathStep=step+1; kid.mathUp=0; kid.mathPerf=[]; return "up"; }
+      return null;
+    }
+    kid.mathUp=0;
+    if(acc<0.70 && step>0){ kid.mathStep=step-1; kid.mathPerf=[]; return "down"; }
+    return null;
+  }
+
+  /* ---------- table recommendation (the adaptive layer for tabel-spil) ----------
+     Priority: a mastered table due for a refresh -> finish a partial -> learn the lowest
+     un-started -> (all mastered) a mixed review across mastered tables. */
+  function recommendTable(kid){
+    var refresh=null, partial=null, learn=null;
+    for(var n=2;n<=10;n++){
+      var mastered=!!(kid.tables&&kid.tables[n]);
+      var days=((kid.tableDays&&kid.tableDays[n])||[]).length;
+      if(mastered){ if(refresh==null && needsRefresh(kid,n)) refresh=n; }
+      else if(days>=1){ if(partial==null) partial=n; }
+      else if(learn==null) learn=n;
+    }
+    if(refresh!=null) return {n:refresh, why:"genopfrisk"};
+    if(partial!=null) return {n:partial, why:"færdiggør"};
+    if(learn!=null)   return {n:learn,   why:"ny"};
+    return {n:"mix", why:"alle mestret"};
+  }
+
   /* ---------- shared "stop for today" call-to-action (the 8 h'ers "hvad bagefter") ----------
      Makes "you're done — go play" the prominent path, and demotes "do it again". */
   function doneCTA(p,secondary){
@@ -496,6 +562,7 @@
       math:{}, /* per-level stats, lazy */
       goals:[], history:[], /* Måltavle: goals + achieved history */
       wpmBest:0, tables:{}, tableDays:{}, lastPerfect:{}, /* tables[n]=mastered; tableDays[n]=distinct perfect-day keys; lastPerfect[n]=last perfect date */
+      mathStep:seedMathStep(age), mathPerf:[], mathUp:0, /* adaptive math difficulty (rung + rolling first-attempt log + step-up hysteresis) */
       xp:0, badges:[], stats:{cards:0,correct:0} /* progress layer */ };
   }
   function seedWords(kid){
@@ -520,6 +587,8 @@
       if(!k.tableDays)k.tableDays={}; if(!k.lastPerfect)k.lastPerfect={};
       Object.keys(k.tables).forEach(function(n){ if(k.tables[n] && (!k.tableDays[n]||!k.tableDays[n].length)){ k.tableDays[n]=[]; for(var i=0;i<TABLE_MASTER_DAYS;i++) k.tableDays[n].push("(tidligere)"); } });
       if(typeof k.xp!=="number")k.xp=0; if(!Array.isArray(k.badges))k.badges=[];
+      if(typeof k.mathStep!=="number")k.mathStep=seedMathStep(k.age); // seed from age so nothing changes day one
+      if(!Array.isArray(k.mathPerf))k.mathPerf=[]; if(typeof k.mathUp!=="number")k.mathUp=0;
       if(!k.stats)k.stats={cards:0,correct:0};
       k.words.forEach(function(w){ if(!w.id)w.id=uid(); if(!w.box)w.box=1; if(!w.due)w.due=todayKey(); });
       k.goals.forEach(function(g){ if(!g.id)g.id=uid(); if(!g.sessions)g.sessions={}; });
@@ -578,32 +647,66 @@
   function rnd(n){return Math.floor(Math.random()*n);}
   function levelOf(kid){ return (parseInt(kid.age,10)||7) >= 9 ? "adv" : "beg"; }
   function genMath(level,avoid){
-    var a,b,op,ans,q,tries=0;
-    do{
-      if(level==="adv"){
-        var pick=rnd(3);
-        if(pick===0){
-          // ~35% of × questions draw from an already-mastered table, so mastered
-          // facts keep recirculating in normal practice instead of decaying.
-          var mt=masteredTables(currentKid());
-          if(mt.length && Math.random()<0.35){ a=mt[rnd(mt.length)]; b=2+rnd(9); }
-          else { a=2+rnd(9); b=2+rnd(9); }
-          op="×"; ans=a*b;
-        }                                                                       // tables 2..10
-        else if(pick===1){ a=20+rnd(80); b=1+rnd(a-1); op="−"; ans=a-b; }       // minus within 100
-        else { a=10+rnd(80); b=5+rnd(90-a>0?90-a:5); ans=a+b; op="+"; }          // plus within ~100
-      } else {
-        if(rnd(2)===0){ a=1+rnd(19); b=1+rnd(20-a>0?20-a:1); ans=a+b; op="+"; }  // plus within 20
-        else { a=2+rnd(18); b=1+rnd(a-1); ans=a-b; op="−"; }                     // minus within 20
+    // level may be a numeric ladder step (preferred) or the legacy "beg"/"adv" string.
+    var step = (typeof level==="number") ? level : (level==="adv"?3:1);
+    step = Math.max(0,Math.min(MATH_STEP_MAX,step));
+    var a,b,op,ans,prompt,type,tries=0;
+    function rangeQ(){ // builds a normal "a op b" question for the current step; may return a special object
+      var key=MATH_STEPS[step].key, pick;
+      if(key==="pm10"){
+        if(rnd(2)===0){ a=1+rnd(9); b=1+rnd(10-a>0?10-a:1); ans=a+b; op="+"; }
+        else { a=2+rnd(8); b=1+rnd(a-1); ans=a-b; op="−"; }
+      } else if(key==="pm20"){
+        if(rnd(2)===0){ a=1+rnd(19); b=1+rnd(20-a>0?20-a:1); ans=a+b; op="+"; }
+        else { a=2+rnd(18); b=1+rnd(a-1); ans=a-b; op="−"; }
+      } else if(key==="pm100"){
+        if(rnd(2)===0){ a=10+rnd(80); b=5+rnd(90-a>0?90-a:5); ans=a+b; op="+"; }
+        else { a=20+rnd(80); b=1+rnd(a-1); op="−"; ans=a-b; }
+      } else if(key==="carry"){
+        if(rnd(2)===0){ a=10+rnd(80); b=10+rnd(80); ans=a+b; op="+"; }       // bigger addends -> usually crosses tens
+        else { a=30+rnd(69); b=10+rnd(a-10>0?a-10:1); op="−"; ans=a-b; }
+      } else if(key==="tables"){
+        pick=rnd(3);
+        if(pick<2){ var mt=masteredTables(currentKid()); if(mt.length && Math.random()<0.35){ a=mt[rnd(mt.length)]; b=2+rnd(9); } else { a=2+rnd(9); b=2+rnd(9); } op="×"; ans=a*b; }
+        else { a=20+rnd(80); b=1+rnd(a-1); op=(rnd(2)?"+":"−"); ans=(op==="+"?a+b:a-b); }   // keep +/- alive
+      } else if(key==="divide"){
+        pick=rnd(3);
+        if(pick===0){ b=2+rnd(9); ans=2+rnd(9); a=b*ans; op="÷"; }            // a ÷ b = ans (clean)
+        else if(pick===1){ a=2+rnd(9); b=2+rnd(9); op="×"; ans=a*b; }
+        else { a=20+rnd(80); b=1+rnd(a-1); op=(rnd(2)?"+":"−"); ans=(op==="+"?a+b:a-b); }
+      } else if(key==="k1000"){
+        pick=rnd(3);
+        if(pick===0){ a=100+rnd(800); b=50+rnd(400); ans=a+b; op="+"; }
+        else if(pick===1){ a=200+rnd(799); b=50+rnd(a-50>0?a-50:50); op="−"; ans=a-b; }
+        else { a=2+rnd(11); b=2+rnd(11); op="×"; ans=a*b; }                   // up to 12×12
+      } else if(key==="twostep"){
+        if(rnd(2)===0){ // missing operand
+          if(rnd(2)===0){ b=2+rnd(9); ans=2+rnd(9); a=b*ans; return {a:ans,b:b,op:"×",answer:ans,prompt:"□ × "+b+" = "+a,type:"gange"}; }
+          var base=10+rnd(40), add=1+rnd(40); return {a:base,b:add,op:"+",answer:add,prompt:base+" + □ = "+(base+add),type:"plus"};
+        }
+        var x=8+rnd(25), y=1+rnd(12), sum=x+y, z=1+rnd(sum-1);                // two same-precedence steps (no precedence traps); z<sum so result stays >=1
+        return {a:x,b:y,op:"+",answer:sum-z,prompt:x+" + "+y+" − "+z,type:"plus"};
+      } else { // depth
+        pick=rnd(3);
+        if(pick===0){ ans=2+rnd(24); a=ans*2; return {a:a,b:2,op:"÷",answer:ans,prompt:"Halvdelen af "+a,type:"minus"}; }
+        if(pick===1){ a=5+rnd(45); return {a:a,b:2,op:"×",answer:a*2,prompt:"Dobbelt af "+a,type:"gange"}; }
+        a=6+rnd(8); b=6+rnd(8); op="×"; ans=a*b;                              // bigger tables 6..13
       }
-      q=a+" "+op+" "+b;
+      return null;
+    }
+    do{
+      var special=rangeQ();
+      if(special){ if(avoid && special.prompt===avoid && tries<6){ tries++; continue; } return special; }
+      prompt=a+" "+op+" "+b;
+      type=(op==="×"?"gange":op==="÷"?"minus":op==="+"?"plus":"minus");
       tries++;
-    } while(avoid && q===avoid && tries<6);
-    return { a:a,b:b,op:op,answer:ans, prompt:q, type:(op==="×"?"gange":op==="+"?"plus":"minus") };
+    } while(avoid && prompt===avoid && tries<6);
+    return { a:a,b:b,op:op,answer:ans, prompt:prompt, type:type };
   }
   function localMathHint(t){
     if(t.op==="+") return {html:"Tip: Tæl videre fra det største tal. <b>"+Math.max(t.a,t.b)+"</b> … og så "+Math.min(t.a,t.b)+" mere."};
     if(t.op==="−") return {html:"Tip: Start ved <b>"+t.a+"</b> og tæl "+t.b+" ned. Eller tænk: hvad skal lægges til "+t.b+" for at få "+t.a+"?"};
+    if(t.op==="÷") return {html:"Tip: Tænk baglæns — hvor mange gange går <b>"+t.b+"</b> op i "+t.a+"? ("+t.b+" × ? = "+t.a+")"};
     return {html:"Tip: <b>"+t.a+" × "+t.b+"</b> betyder "+t.a+" lagt sammen "+t.b+" gange. Brug en tabel du kender tæt på."};
   }
 
@@ -726,7 +829,7 @@
                ai:true };
     }).catch(function(e){
       // local fallback: fresh similar problem + generic hint
-      var nt=genMath(levelOf(kid),t.prompt);
+      var nt=genMath(mathStepOf(kid),t.prompt);
       return { diagnose:"Det er helt okay — den slags driller mange. Lad os tage en ny én roligt.",
                hint:localMathHint(t),
                newTask:{ prompt:nt.prompt, answer:String(nt.answer), type:nt.type },
@@ -1181,8 +1284,8 @@
     var kid=currentKid();
     if(!session){
       var qs=[]; var prev=null;
-      for(var i=0;i<MATH_N;i++){ var t=genMath(levelOf(kid),prev); prev=t.prompt; qs.push(t); }
-      session={ kind:"math", qs:qs, idx:0, correct:0, start:Date.now(), state:"ask", fix:null, fixTries:0, curAnswer:"" };
+      for(var i=0;i<MATH_N;i++){ var t=genMath(mathStepOf(kid),prev); prev=t.prompt; qs.push(t); }
+      session={ kind:"math", qs:qs, idx:0, correct:0, start:Date.now(), qStart:Date.now(), state:"ask", fix:null, fixTries:0, curAnswer:"" };
     }
     if(session.idx>=session.qs.length){ return mathDone(kid); }
 
@@ -1211,7 +1314,7 @@
       // show original prompt small + the fix box with new task
       p.appendChild(el("div","qbig qmath",esc(t.prompt)));
       p.appendChild(buildFixBox(session.fix,function(val){
-        genericFix(kid,val,function(){ session.correct++; session.idx++; session.state="ask"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); });
+        genericFix(kid,val,function(){ session.correct++; session.idx++; session.state="ask"; session.curAnswer=""; session.fix=null; session.fixTries=0; session.qStart=Date.now(); render(); });
       },false));
       app.appendChild(p);
       return;
@@ -1221,16 +1324,20 @@
   function submitMath(kid,t,val){
     var v=parseInt(val,10);
     if(!val.toString().trim()||isNaN(v)) return;
+    var ms=Math.max(300, Date.now()-(session.qStart||Date.now())); // first-attempt response time
     if(v===t.answer){
+      logMathPerf(kid,true,ms);
       session.correct++; award(kid,XP.correct);
-      session.idx++; session.state="ask"; session.curAnswer=""; session.fix=null; session.fixTries=0;
+      session.idx++; session.state="ask"; session.curAnswer=""; session.fix=null; session.fixTries=0; session.qStart=Date.now();
       render();
     } else {
+      logMathPerf(kid,false,ms);
       mathLoadingFix(kid,t,val,"Matematik","talfakta",function(){ session.state="fixing"; },"var(--math)");
     }
   }
   function mathDone(kid){
     markDone(kid,"math"); award(kid,XP.moduleDone);
+    var levelChange=adjustMathStep(kid); save(); // controller: nudge difficulty toward the ~85% zone
     var secs=Math.max(1,Math.round((Date.now()-session.start)/1000));
     app.appendChild(backbar("Matematik","Færdig","",function(){}));
     var p=el("div","panel"); p.style.setProperty("--ac","var(--math)");
@@ -1242,6 +1349,8 @@
       '<div class="sumStat"><div class="v" style="color:var(--neon)">'+streakOf(kid,"math")+' 🔥</div><div class="k">Streak</div></div>';
     p.appendChild(grid);
     p.appendChild(el("p","readingText","Husk: det er ikke vigtigt at være hurtig. Det vigtige er at øve lidt hver dag — så bliver det nemmere helt af sig selv."));
+    if(levelChange==="up"){ var lu=el("div","feedback ok"); lu.textContent="💪 Du er klar til lidt sværere — nyt niveau: "+mathStepName(kid)+"."; p.appendChild(lu); }
+    else if(levelChange==="down"){ var ld=el("div","feedback"); ld.textContent="Vi tager et par lidt nemmere nu ("+mathStepName(kid)+") — så sidder det bedre. 👍"; p.appendChild(ld); }
     doneCTA(p,{label:"En gang til", onclick:function(){ session=null; render(); }});
     app.appendChild(p); confetti();
   }
@@ -1450,12 +1559,30 @@
      MATEMATIK menu + TABEL-SPIL
      ===================================================================== */
   function renderMathMenu(){
+    var kid=currentKid();
     app.appendChild(backbar("Matematik","Vælg en øvelse",function(){ go("home"); }));
     var p=el("div","panel");
     var b1=menuBtn("🧮  Talfakta  (plus · minus · gange)","var(--math)",function(){ go("talfakta"); }); b1.style.marginTop="0";
     p.appendChild(b1);
     p.appendChild(menuBtn("✖️  Tabel-spil","var(--math)",function(){ go("tabelspil"); }));
     app.appendChild(p);
+
+    // adaptive-level readout + parent manual override (talfakta difficulty follows the child)
+    var lp=el("div","panel"); lp.style.marginTop="14px";
+    var info=el("div","readingText"); info.style.fontSize="14.5px"; info.style.marginBottom="2px";
+    info.innerHTML="Niveau i talfakta: <b>"+esc(mathStepName(kid))+"</b>";
+    lp.appendChild(info);
+    var sub=el("div","readingText"); sub.style.fontSize="12.5px"; sub.style.opacity=".75"; sub.style.marginTop="0";
+    sub.textContent="Tilpasser sig selv (trin "+(mathStepOf(kid)+1)+" af "+(MATH_STEP_MAX+1)+"). Forælder kan justere:";
+    lp.appendChild(sub);
+    var ctl=el("div"); ctl.style.cssText="display:flex;gap:10px;margin-top:8px";
+    var dn=el("button","linkbtn","▼ lidt nemmere"); dn.style.color="var(--mut)";
+    dn.disabled=mathStepOf(kid)<=0; dn.onclick=function(){ setMathStep(kid,mathStepOf(kid)-1); };
+    var up=el("button","linkbtn","lidt sværere ▲"); up.style.color="var(--mut)";
+    up.disabled=mathStepOf(kid)>=MATH_STEP_MAX; up.onclick=function(){ setMathStep(kid,mathStepOf(kid)+1); };
+    ctl.appendChild(dn); ctl.appendChild(up);
+    lp.appendChild(ctl);
+    app.appendChild(lp);
   }
   function renderTabelspil(){
     var kid=currentKid();
@@ -1464,6 +1591,14 @@
       app.appendChild(backbar("Tabel-spil","Vælg en tabel",function(){ go("math-menu"); }));
       var p=el("div","panel"); p.style.setProperty("--ac","var(--math)");
       p.appendChild(el("p","readingText","Vælg den tabel, du vil øve. ⭐️ = mestret (alle 10 rigtige på "+TABLE_MASTER_DAYS+" forskellige dage). ◐ = godt på vej. 🔄 = tid til at genopfriske."));
+      // adaptive recommendation: one tap to the table that matters most today
+      var rec=recommendTable(kid);
+      var recLabel = rec.n==="mix"
+        ? "🔄 Blandet tabel-træning (alle mestret!)"
+        : "⭐ Anbefalet i dag: "+rec.n+"-tabel"+(rec.why==="genopfrisk"?" (genopfrisk)":rec.why==="færdiggør"?" (gør færdig)":" (ny)");
+      var recBtn=el("button","bigbtn green",recLabel); recBtn.style.marginBottom="14px";
+      recBtn.onclick=function(){ if(rec.n==="mix") startTableMix(); else startTable(rec.n); };
+      p.appendChild(recBtn);
       var grid=el("div","tableGrid");
       for(var n=2;n<=10;n++){ (function(n){
         var mastered=!!kid.tables[n];
@@ -1480,7 +1615,7 @@
     }
     if(session.idx>=session.qs.length) return tableDone(kid);
     var t=session.qs[session.idx];
-    app.appendChild(backbar(session.table+"-tabel","Opgave "+(session.idx+1)+" af "+session.qs.length,function(){ go("tabelspil"); }));
+    app.appendChild(backbar((typeof session.table==="number"?session.table+"-tabel":"Blandet tabel"),"Opgave "+(session.idx+1)+" af "+session.qs.length,function(){ go("tabelspil"); }));
     var pp=el("div","panel"); pp.style.setProperty("--ac","var(--math)");
     pp.appendChild(progressStrip(session.idx,session.qs.length,"var(--math)"));
     if(session.state==="fixing"){
@@ -1502,13 +1637,35 @@
     session.table=n; session.qs=qs; session.idx=0; session.correct=0; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0;
     render();
   }
+  function startTableMix(){
+    var kid=currentKid(), mt=masteredTables(kid);
+    if(!mt.length){ startTable(2); return; }
+    var qs=[]; for(var i=0;i<10;i++){ var a=mt[rnd(mt.length)], b=2+rnd(9); qs.push({a:a,b:b,op:"×",answer:a*b,prompt:a+" × "+b,type:"gange"}); }
+    session.table="mix"; session.qs=qs; session.idx=0; session.correct=0; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0;
+    render();
+  }
   function tabSubmit(kid,t,val){
     var v=parseInt(val,10); if(!String(val).trim()||isNaN(v)) return;
     if(v===t.answer){ session.correct++; award(kid,XP.correct); session.idx++; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); }
-    else { mathLoadingFix(kid,t,val,session.table+"-tabel","tabel",function(){ session.state="fixing"; },"var(--math)"); }
+    else { mathLoadingFix(kid,t,val,(typeof session.table==="number"?session.table+"-tabel":"Blandet tabel"),"tabel",function(){ session.state="fixing"; },"var(--math)"); }
   }
   function tabFix(kid,val){ genericFix(kid,val,function(){ session.idx++; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); }); }
   function tableDone(kid){
+    // mixed review across mastered tables: no single table to master, just keep them fresh
+    if(typeof session.table!=="number"){
+      markDone(kid,"math"); award(kid,XP.moduleDone);
+      var perfectMix=session.correct===session.qs.length;
+      app.appendChild(backbar("Blandet tabel","Færdig",function(){ go("tabelspil"); }));
+      var pmx=el("div","panel"); pmx.style.setProperty("--ac","var(--math)");
+      var hmx=el("div","qbig"); hmx.style.fontSize="30px"; hmx.textContent= perfectMix? "Alle 10 rigtige! 🎉" : "Godt øvet på tværs! 🧮"; pmx.appendChild(hmx);
+      var gmx=el("div","sumGrid");
+      gmx.innerHTML='<div class="sumStat"><div class="v" style="color:var(--green)">'+session.correct+'/'+session.qs.length+'</div><div class="k">Rigtige</div></div>'+
+        '<div class="sumStat"><div class="v" style="color:var(--neon)">'+streakOf(kid,"math")+' 🔥</div><div class="k">Streak</div></div>';
+      pmx.appendChild(gmx);
+      pmx.appendChild(el("p","readingText","Du holdt dine mestrede tabeller ved lige — det er sådan de bliver siddende."));
+      doneCTA(pmx,{label:"Vælg en anden tabel", onclick:function(){ go("tabelspil"); }});
+      app.appendChild(pmx); if(perfectMix) confetti(); return;
+    }
     markDone(kid,"math"); award(kid,XP.moduleDone);
     var n=session.table, perfect=session.correct===session.qs.length;
     kid.tableDays=kid.tableDays||{}; kid.lastPerfect=kid.lastPerfect||{};
@@ -1562,7 +1719,7 @@
         session.fix=Object.assign({},fix,{diagnose:"Det er okay! Svaret er "+ans+". Vi tager den næste roligt.",hint:"",reveal:true});
         render(); setTimeout(function(){ onSuccess(); },1700);
       } else {
-        var nt=genMath(levelOf(kid),fix.newTask.prompt);
+        var nt=genMath(mathStepOf(kid),fix.newTask.prompt);
         session.fix=Object.assign({},fix,{diagnose:"Tæt på! Prøv lige denne 🙂",newTask:{prompt:nt.prompt,answer:String(nt.answer),type:nt.type}});
         session.curAnswer=""; render();
       }
@@ -1658,7 +1815,7 @@
     var kid=currentKid();
     if(!session){
       var items=[], prev=null;
-      for(var i=0;i<4;i++){ var t=genMath(levelOf(kid),prev); prev=t.prompt; items.push({type:"math",t:t}); }
+      for(var i=0;i<4;i++){ var t=genMath(mathStepOf(kid),prev); prev=t.prompt; items.push({type:"math",t:t}); }
       var ws=(dueCards(kid).length?dueCards(kid):kid.words).slice(0,3);
       ws.forEach(function(w){ items.push({type:"word",w:w}); });
       items.sort(function(){ return Math.random()-0.5; });
