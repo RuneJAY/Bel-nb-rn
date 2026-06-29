@@ -126,6 +126,16 @@
   .readingText{font-family:'Lexend',sans-serif;font-size:22px;line-height:1.75;letter-spacing:.2px;
     color:var(--ink);background:var(--bg2);border:1px solid var(--line);border-radius:16px;padding:20px 18px;margin-bottom:6px}
 
+  /* accessibility: reading-friendly spacing + big text (toggled in Indstillinger) */
+  body.readfriendly .readingText,body.readfriendly .flashWord,body.readfriendly .flashSentence,
+  body.readfriendly .answerText,body.readfriendly .inp{letter-spacing:.06em;word-spacing:.16em;line-height:1.95}
+  body.readfriendly .readingText{font-weight:500}
+  body.bigtext .readingText{font-size:26px}
+  body.bigtext .answerText{font-size:24px}
+  body.bigtext .flashWord{font-size:56px}
+  body.bigtext .qmath{font-size:70px}
+  body.bigtext .inp{font-size:22px}
+
   /* Flashcard */
   .flashcard{min-height:180px;border-radius:20px;border:2px solid color-mix(in srgb,var(--ac) 45%, var(--line));
     background:color-mix(in srgb,var(--ac) 10%, var(--bg2));display:grid;place-items:center;padding:24px;text-align:center;
@@ -322,6 +332,16 @@
 
   <div class="btnrow"><button class="btn primary" id="setSave">Gem</button></div>
 
+  <h2 style="margin-top:26px">Visning</h2>
+  <label class="f" style="display:flex;align-items:center;gap:11px;cursor:pointer">
+    <input type="checkbox" id="setReadFriendly" style="width:22px;height:22px;flex:0 0 auto" />
+    <span style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;font-weight:700;color:var(--ink)">Læsevenlig tilstand (mere luft mellem bogstaver og linjer)</span>
+  </label>
+  <label class="f" style="display:flex;align-items:center;gap:11px;margin-top:12px;cursor:pointer">
+    <input type="checkbox" id="setBigText" style="width:22px;height:22px;flex:0 0 auto" />
+    <span style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;font-weight:700;color:var(--ink)">Stor tekst (godt til de yngste)</span>
+  </label>
+
   <h2 style="margin-top:26px">Børn</h2>
   <div id="kidAdmin"></div>
   <button class="btn ghost" id="addKid2" style="margin-top:12px">+ Tilføj barn</button>
@@ -331,6 +351,7 @@
   <div class="backupItem"><div class="bi">💾</div><div class="bt"><b>Gem backup</b><small>Henter en fil med alle data</small></div><button id="exportBtn">Gem fil</button></div>
   <div class="backupItem"><div class="bi">📂</div><div class="bt"><b>Gendan backup</b><small>Indlæs en gemt fil</small></div><button id="importBtn">Vælg fil</button></div>
   <input type="file" id="importFile" accept="application/json,.json" hidden />
+  <p class="note" id="backupStatus"></p>
   <p class="note">På iPad: Safari → del → “Føj til hjemmeskærm”. Husk backup ca. ugentligt — Safari kan rydde data efter 7 dages inaktivitet.</p>
 
   <div class="btnrow"><button class="btn ghost" id="resetBtn">Nulstil alt</button><button class="btn primary" id="setClose">Luk</button></div>
@@ -482,6 +503,146 @@
     return {n:"mix", why:"alle mestret"};
   }
 
+  /* ---------- adaptive READING level (mirrors the math controller) ----------
+     kid.readStep moves on first-try comprehension accuracy only (no speed target).
+     Seeded from age; parents can also nudge it by hand under Læsning. */
+  var READ_STEPS=[
+    {key:"start", name:"Korte ord og sætninger", bank:"beg", inferens:false},
+    {key:"beg",   name:"Sigtord og korte tekster", bank:"beg", inferens:false},
+    {key:"mid",   name:"Længere tekster",          bank:"adv", inferens:false},
+    {key:"inf",   name:"Læs mellem linjerne",       bank:"adv", inferens:true}
+  ];
+  var READ_STEP_MAX=READ_STEPS.length-1;
+  function seedReadStep(age){ return (parseInt(age,10)||7) >= 9 ? 2 : 1; }
+  function readStepOf(kid){ var s=(kid&&typeof kid.readStep==="number")?kid.readStep:seedReadStep(kid&&kid.age); return Math.max(0,Math.min(READ_STEP_MAX,s)); }
+  function readStepName(kid){ return READ_STEPS[readStepOf(kid)].name; }
+  function readCfg(kid){ return READ_STEPS[readStepOf(kid)]; }
+  function setReadStep(kid,s){ kid.readStep=Math.max(0,Math.min(READ_STEP_MAX,s)); kid.readUp=0; kid.readPerf=[]; save(); render(); }
+  function logReadPerf(kid,ok){ if(!Array.isArray(kid.readPerf)) kid.readPerf=[]; kid.readPerf.push({ok:!!ok,step:readStepOf(kid)}); if(kid.readPerf.length>18) kid.readPerf=kid.readPerf.slice(-18); }
+  // Returns "up" | "down" | null. Call after a comprehension session.
+  function adjustReadStep(kid){
+    var step=readStepOf(kid); kid.readStep=step;
+    var atStep=(kid.readPerf||[]).filter(function(r){ return r.step===step; });
+    if(atStep.length<6) return null;                  // comprehension yields fewer items than math
+    var recent=atStep.slice(-9);
+    var acc=recent.reduce(function(s,r){ return s+(r.ok?1:0); },0)/recent.length;
+    if(acc>=0.85){ kid.readUp=(kid.readUp||0)+1; if(kid.readUp>=2 && step<READ_STEP_MAX){ kid.readStep=step+1; kid.readUp=0; kid.readPerf=[]; return "up"; } return null; }
+    kid.readUp=0;
+    if(acc<0.55 && step>0){ kid.readStep=step-1; kid.readPerf=[]; return "down"; }
+    return null;
+  }
+
+  /* ---------- text-to-speech (read-aloud for the youngest) ----------
+     Uses the device's built-in Danish voice if present; a silent no-op if unsupported. */
+  function canSpeak(){ try{ return !!(window.speechSynthesis && window.SpeechSynthesisUtterance); }catch(e){ return false; } }
+  function speak(text,lang){
+    if(!canSpeak()||!text) return;
+    lang=lang||"da-DK";
+    try{
+      window.speechSynthesis.cancel();
+      var u=new window.SpeechSynthesisUtterance(String(text));
+      u.lang=lang; u.rate=0.9; u.pitch=1.0;
+      var voices=(window.speechSynthesis.getVoices&&window.speechSynthesis.getVoices())||[];
+      var pre=lang.slice(0,2).toLowerCase();
+      var v=voices.filter(function(x){ return (x.lang||"").slice(0,2).toLowerCase()===pre; })[0];
+      if(v) u.voice=v;
+      window.speechSynthesis.speak(u);
+    }catch(e){}
+  }
+  function speakBtn(text,color,lang,label){
+    if(!canSpeak()) return el("span",null,""); // nothing if device can't speak
+    var b=el("button","ttsBtn",label||"🔊 Læs op");
+    b.style.cssText="margin-top:10px;background:transparent;border:1.5px solid var(--line);color:var(--mut);border-radius:12px;padding:9px 14px;font-family:'Nunito';font-weight:700;font-size:14px;cursor:pointer";
+    if(color) b.style.borderColor="color-mix(in srgb,"+color+" 45%, var(--line))";
+    b.onclick=function(){ speak(text,lang); };
+    return b;
+  }
+
+  /* ---------- global daily streak (any subject) — gentle, weekend-lenient ---------- */
+  function globalStreak(kid){ return streakDays(function(dk){ return activeOn(kid,dk); }, true); }
+
+  /* ---------- math-fact SRS ("sværeste regnestykker kommer igen") ----------
+     Tracks specific facts the child misses and resurfaces them on a spacing schedule,
+     so e.g. "7 × 8" comes back until it sticks — complementing the level controller. */
+  function mfKey(t){ return String(t.prompt); }
+  function recordHardFact(kid,t){
+    if(!kid.mathHard) kid.mathHard={};
+    var k=mfKey(t), e=kid.mathHard[k]||{prompt:t.prompt,answer:Number(t.answer),type:t.type,miss:0};
+    e.miss=(e.miss||0)+1; e.answer=Number(t.answer); e.type=t.type; e.due=todayKey();
+    kid.mathHard[k]=e; save();
+  }
+  function easeHardFact(kid,t){
+    if(!kid.mathHard) return; var k=mfKey(t), e=kid.mathHard[k]; if(!e) return;
+    e.miss=(e.miss||1)-1;
+    if(e.miss<=0){ delete kid.mathHard[k]; }      // mastered -> drop it
+    else { e.due=dkey(addDays(today(), e.miss>=2?2:4)); } // push the next review out a few days
+    save();
+  }
+  function dueHardFacts(kid){
+    var tk=todayKey(), out=[]; var m=kid.mathHard||{};
+    for(var k in m){ if(m[k] && (!m[k].due || m[k].due<=tk)) out.push(m[k]); }
+    return out;
+  }
+  function pickHardFact(kid){ var d=dueHardFacts(kid); if(!d.length) return null; var e=d[rnd(d.length)];
+    return { prompt:e.prompt, answer:Number(e.answer), type:e.type, fromHard:true }; }
+  function hardestFacts(kid,max){
+    var m=kid.mathHard||{}, arr=[]; for(var k in m){ if(m[k]) arr.push(m[k]); }
+    arr.sort(function(a,b){ return (b.miss||0)-(a.miss||0); });
+    return arr.slice(0,max||6);
+  }
+
+  /* ---------- English vocabulary SRS (reuses gradeCard on a separate card list) ---------- */
+  function enDue(kid){ var tk=todayKey(); return (kid.enWords||[]).filter(function(w){ return (w.due||tk)<=tk; }); }
+  function enLevelAdv(kid){ return readStepOf(kid)>=2 || (parseInt(kid.age,10)||7)>=9; }
+
+  /* ---------- adaptive CLOCK level (same controller pattern, accuracy-only) ---------- */
+  var CLOCK_STEPS=[
+    {name:"Hele timer", mins:[0]},
+    {name:"Hele og halve", mins:[0,0,30,30]},
+    {name:"Kvarter", mins:[0,15,30,45]},
+    {name:"5-minutter", mins:[0,5,10,15,20,25,30,35,40,45,50,55]}
+  ];
+  var CLOCK_STEP_MAX=CLOCK_STEPS.length-1;
+  function clockStepOf(kid){ var s=(kid&&typeof kid.clockStep==="number")?kid.clockStep:((parseInt(kid&&kid.age,10)||7)>=9?1:0); return Math.max(0,Math.min(CLOCK_STEP_MAX,s)); }
+  function clockStepName(kid){ return CLOCK_STEPS[clockStepOf(kid)].name; }
+  function logClockPerf(kid,ok){ if(!Array.isArray(kid.clockPerf)) kid.clockPerf=[]; kid.clockPerf.push({ok:!!ok,step:clockStepOf(kid)}); if(kid.clockPerf.length>18) kid.clockPerf=kid.clockPerf.slice(-18); }
+  function adjustClockStep(kid){
+    var step=clockStepOf(kid); kid.clockStep=step;
+    var atStep=(kid.clockPerf||[]).filter(function(r){ return r.step===step; });
+    if(atStep.length<6) return null;
+    var recent=atStep.slice(-9), acc=recent.reduce(function(s,r){ return s+(r.ok?1:0); },0)/recent.length;
+    if(acc>=0.85){ kid.clockUp=(kid.clockUp||0)+1; if(kid.clockUp>=2 && step<CLOCK_STEP_MAX){ kid.clockStep=step+1; kid.clockUp=0; kid.clockPerf=[]; return "up"; } return null; }
+    kid.clockUp=0;
+    if(acc<0.55 && step>0){ kid.clockStep=step-1; kid.clockPerf=[]; return "down"; }
+    return null;
+  }
+
+  /* ---------- accessibility (reading-friendly spacing + big text) ---------- */
+  function applyA11y(){
+    try{
+      var b=document.body;
+      b.classList.toggle("readfriendly", !!(state.settings&&state.settings.readfriendly));
+      b.classList.toggle("bigtext", !!(state.settings&&state.settings.bigtext));
+    }catch(e){}
+  }
+
+  /* ---------- backup reminder (mitigates Safari's 7-day ITP storage clearing) ---------- */
+  function backupOverdue(){
+    var lb=state.settings&&state.settings.lastBackup;
+    if(!lb) return true;
+    var d=new Date(lb); if(isNaN(d.getTime())) return true;
+    return (today()-d)/86400000 >= 7;
+  }
+  function doBackup(){
+    try{
+      var blob=new Blob([JSON.stringify(state,null,2)],{type:"application/json"});
+      var url=URL.createObjectURL(blob),a=document.createElement("a");
+      a.href=url; a.download="laering-backup-"+todayKey()+".json"; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){URL.revokeObjectURL(url);},1000);
+    }catch(e){}
+    state.settings.lastBackup=todayKey(); save();
+  }
+
   /* ---------- shared "stop for today" call-to-action (the 8 h'ers "hvad bagefter") ----------
      Makes "you're done — go play" the prominent path, and demotes "do it again". */
   function doneCTA(p,secondary){
@@ -505,18 +666,37 @@
   // Harder words / gloser (~10 yrs)
   var WORDS_ADVANCED=["fordi","måske","gennem","allerede","pludselig","selvfølgelig","forskellig","spændende","alligevel","bestemt","nødvendig","oplevelse","undersøge","forklare","beslutte","sammenligne","omkring","eventyr","naturligvis","desværre"];
 
+  // English vocabulary (en word + Danish meaning). Used by the English module on the SRS engine.
+  var ENGLISH_BEGINNER=[
+    {en:"dog",da:"hund"},{en:"cat",da:"kat"},{en:"house",da:"hus"},{en:"water",da:"vand"},{en:"red",da:"rød"},
+    {en:"blue",da:"blå"},{en:"green",da:"grøn"},{en:"sun",da:"sol"},{en:"tree",da:"træ"},{en:"book",da:"bog"},
+    {en:"friend",da:"ven"},{en:"happy",da:"glad"},{en:"big",da:"stor"},{en:"small",da:"lille"},{en:"food",da:"mad"},
+    {en:"milk",da:"mælk"},{en:"school",da:"skole"},{en:"play",da:"lege"},{en:"run",da:"løbe"},{en:"car",da:"bil"}
+  ];
+  var ENGLISH_ADVANCED=[
+    {en:"because",da:"fordi"},{en:"maybe",da:"måske"},{en:"already",da:"allerede"},{en:"suddenly",da:"pludselig"},
+    {en:"different",da:"forskellig"},{en:"exciting",da:"spændende"},{en:"important",da:"vigtig"},{en:"weather",da:"vejr"},
+    {en:"adventure",da:"eventyr"},{en:"explain",da:"forklare"},{en:"decide",da:"beslutte"},{en:"compare",da:"sammenligne"},
+    {en:"experience",da:"oplevelse"},{en:"dangerous",da:"farlig"},{en:"beautiful",da:"smuk"},{en:"strong",da:"stærk"},
+    {en:"answer",da:"svar"},{en:"question",da:"spørgsmål"},{en:"remember",da:"huske"},{en:"together",da:"sammen"}
+  ];
+
   // Local comprehension texts (fallback when no API key). Lenient keyword answers.
   var TEXTS_BEGINNER=[
     {tekst:"Mille har en kat. Katten hedder Pus. Pus er sort og hvid. Hver morgen får Pus mælk. Bagefter sover Pus i vinduet i solen.",
-     spoergsmaal:[{q:"Hvad hedder katten?",a:["pus"]},{q:"Hvilke farver er Pus?",a:["sort","hvid"]},{q:"Hvad får Pus om morgenen?",a:["mælk"]}]},
+     spoergsmaal:[{q:"Hvad hedder katten?",a:["pus"]},{q:"Hvilke farver er Pus?",a:["sort","hvid"]},{q:"Hvad får Pus om morgenen?",a:["mælk"]}],
+     inf:{q:"Kan Pus godt lide solen, tror du?",a:["ja","kan","varmt","varme"]}},
     {tekst:"Noah og far cykler i skoven. De ser en rød fugl og en stor sten. Far finder et fint blad. Noah putter bladet i sin lomme.",
-     spoergsmaal:[{q:"Hvor cykler de?",a:["skov","skoven"]},{q:"Hvilken farve har fuglen?",a:["rød"]},{q:"Hvad putter Noah i lommen?",a:["blad","bladet"]}]}
+     spoergsmaal:[{q:"Hvor cykler de?",a:["skov","skoven"]},{q:"Hvilken farve har fuglen?",a:["rød"]},{q:"Hvad putter Noah i lommen?",a:["blad","bladet"]}],
+     inf:{q:"Hvorfor gemmer Noah bladet, tror du?",a:["fint","smukt","kan lide","gemme","pænt"]}}
   ];
   var TEXTS_ADVANCED=[
     {tekst:"Sofie skulle holde et oplæg om vulkaner i klassen. Hun var nervøs, men hun havde øvet sig hjemme i en hel uge. Da hun begyndte at fortælle om den glødende lava, glemte hun helt sin nervøsitet. Bagefter klappede hele klassen.",
-     spoergsmaal:[{q:"Hvad handlede Sofies oplæg om?",a:["vulkan","vulkaner"]},{q:"Hvor længe havde hun øvet?",a:["uge","en uge","hel uge"]},{q:"Hvordan havde hun det til sidst?",a:["glad","stolt","ikke nervøs","godt"]}]},
+     spoergsmaal:[{q:"Hvad handlede Sofies oplæg om?",a:["vulkan","vulkaner"]},{q:"Hvor længe havde hun øvet?",a:["uge","en uge","hel uge"]},{q:"Hvordan havde hun det til sidst?",a:["glad","stolt","ikke nervøs","godt"]}],
+     inf:{q:"Hvorfor klappede klassen, tror du?",a:["god","dygtig","flot","godt","fint"]}},
     {tekst:"Da familien vågnede, var haven helt hvid. Det havde sneet om natten. Lillebror ville straks ud at lave en snemand, men storesøster mindede ham om at tage vanter på først. Sammen rullede de tre store snebolde.",
-     spoergsmaal:[{q:"Hvorfor var haven hvid?",a:["sne","sneet","det havde sneet"]},{q:"Hvad skulle lillebror tage på?",a:["vanter","vanter på"]},{q:"Hvor mange snebolde rullede de?",a:["tre","3"]}]}
+     spoergsmaal:[{q:"Hvorfor var haven hvid?",a:["sne","sneet","det havde sneet"]},{q:"Hvad skulle lillebror tage på?",a:["vanter","vanter på"]},{q:"Hvor mange snebolde rullede de?",a:["tre","3"]}],
+     inf:{q:"Hvilken årstid er det mon?",a:["vinter"]}}
   ];
 
   // Read-aloud passages for the words/minute timer
@@ -563,16 +743,24 @@
       goals:[], history:[], /* Måltavle: goals + achieved history */
       wpmBest:0, tables:{}, tableDays:{}, lastPerfect:{}, /* tables[n]=mastered; tableDays[n]=distinct perfect-day keys; lastPerfect[n]=last perfect date */
       mathStep:seedMathStep(age), mathPerf:[], mathUp:0, /* adaptive math difficulty (rung + rolling first-attempt log + step-up hysteresis) */
+      readStep:seedReadStep(age), readPerf:[], readUp:0, /* adaptive reading difficulty (same pattern, accuracy-only) */
+      enWords:[], /* English vocabulary cards (SRS) */
+      mathHard:{}, /* math-fact SRS: missed facts that resurface */
+      clockStep:((parseInt(age,10)||7)>=9?1:0), clockPerf:[], clockUp:0, /* adaptive clock difficulty */
       xp:0, badges:[], stats:{cards:0,correct:0} /* progress layer */ };
   }
   function seedWords(kid){
     var base = (parseInt(kid.age,10)||7) >= 9 ? WORDS_ADVANCED : WORDS_BEGINNER;
-    kid.words = base.map(function(w){ return { id:uid(), word:w, box:1, due:todayKey() }; });
+    kid.words = base.map(function(w){ return { id:uid(), word:w, box:1, due:todayKey(), hard:0 }; });
+  }
+  function seedEnWords(kid){
+    var base = enLevelAdv(kid) ? ENGLISH_ADVANCED : ENGLISH_BEGINNER;
+    kid.enWords = base.map(function(p){ return { id:uid(), en:p.en, da:p.da, box:1, due:todayKey(), hard:0 }; });
   }
   function defaultState(){
-    var a=blankKid("Barn 1","10",PALETTE[0],"🦊"); seedWords(a);
-    var b=blankKid("Barn 2","7",PALETTE[1],"🐢"); seedWords(b);
-    return { v:1, settings:{ apiKey:"", model:"gemini-2.5-flash", logUrl:"", logNames:false }, kids:[a,b], currentKid:a.id };
+    var a=blankKid("Barn 1","10",PALETTE[0],"🦊"); seedWords(a); seedEnWords(a);
+    var b=blankKid("Barn 2","7",PALETTE[1],"🐢"); seedWords(b); seedEnWords(b);
+    return { v:1, settings:{ apiKey:"", model:"gemini-2.5-flash", logUrl:"", logNames:false, readfriendly:false, bigtext:false, lastBackup:"" }, kids:[a,b], currentKid:a.id };
   }
   function migrate(s){
     if(!s||!Array.isArray(s.kids)) return defaultState();
@@ -580,6 +768,9 @@
     if(!s.settings.model) s.settings.model="gemini-2.5-flash";
     if(typeof s.settings.logUrl!=="string") s.settings.logUrl="";
     if(typeof s.settings.logNames!=="boolean") s.settings.logNames=false;
+    if(typeof s.settings.readfriendly!=="boolean") s.settings.readfriendly=false;
+    if(typeof s.settings.bigtext!=="boolean") s.settings.bigtext=false;
+    if(typeof s.settings.lastBackup!=="string") s.settings.lastBackup="";
     s.kids.forEach(function(k){
       if(!k.id)k.id=uid(); if(!k.words)k.words=[]; if(!k.done)k.done={}; if(!k.math)k.math={};
       if(!Array.isArray(k.goals))k.goals=[]; if(!Array.isArray(k.history))k.history=[];
@@ -589,8 +780,15 @@
       if(typeof k.xp!=="number")k.xp=0; if(!Array.isArray(k.badges))k.badges=[];
       if(typeof k.mathStep!=="number")k.mathStep=seedMathStep(k.age); // seed from age so nothing changes day one
       if(!Array.isArray(k.mathPerf))k.mathPerf=[]; if(typeof k.mathUp!=="number")k.mathUp=0;
+      if(typeof k.readStep!=="number")k.readStep=seedReadStep(k.age); // adaptive reading, seeded from age
+      if(!Array.isArray(k.readPerf))k.readPerf=[]; if(typeof k.readUp!=="number")k.readUp=0;
+      if(!k.mathHard||typeof k.mathHard!=="object")k.mathHard={}; // math-fact SRS
+      if(typeof k.clockStep!=="number")k.clockStep=((parseInt(k.age,10)||7)>=9?1:0);
+      if(!Array.isArray(k.clockPerf))k.clockPerf=[]; if(typeof k.clockUp!=="number")k.clockUp=0;
+      if(!Array.isArray(k.enWords)||!k.enWords.length) seedEnWords(k); // English vocabulary cards
+      k.enWords.forEach(function(w){ if(!w.id)w.id=uid(); if(!w.box)w.box=1; if(!w.due)w.due=todayKey(); if(typeof w.hard!=="number")w.hard=0; });
       if(!k.stats)k.stats={cards:0,correct:0};
-      k.words.forEach(function(w){ if(!w.id)w.id=uid(); if(!w.box)w.box=1; if(!w.due)w.due=todayKey(); });
+      k.words.forEach(function(w){ if(!w.id)w.id=uid(); if(!w.box)w.box=1; if(!w.due)w.due=todayKey(); if(typeof w.hard!=="number")w.hard=0; });
       k.goals.forEach(function(g){ if(!g.id)g.id=uid(); if(!g.sessions)g.sessions={}; });
     });
     if(!s.currentKid && s.kids[0]) s.currentKid=s.kids[0].id;
@@ -635,7 +833,7 @@
   }
   function gradeCard(w,grade){ // grade: 'good'|'mid'|'bad'
     if(grade==='good') w.box=Math.min(5,(w.box||1)+1);
-    else if(grade==='bad') w.box=1;
+    else if(grade==='bad'){ w.box=1; w.hard=(w.hard||0)+1; } // track how often a word trips the child up
     // 'mid' keeps box
     var days=BOX_DAYS[w.box]||1;
     if(grade==='bad') days=0; // see again today/this session
@@ -840,8 +1038,13 @@
   // Comprehension generation (AI) -> {tekst, spoergsmaal:[{q,a:[...]}]}
   function genComprehension(kid){
     var sys=systemInstruction(kid);
-    var user="Lav en kort, hyggelig dansk tekst (3-5 sætninger) der passer til "+levelBand(kid)
-      +" om et hverdagsemne (dyr, leg, natur, familie, skole). Lav derefter præcis 3 spørgsmål til teksten.\n"
+    var cfg=readCfg(kid);
+    var sværhed = cfg.bank==="adv" ? "4-6 sætninger, lidt mere ordforråd" : "3-4 korte, lette sætninger";
+    var spørgsmålstype = cfg.inferens
+      ? "Lav 3 spørgsmål: 2 hvor svaret står direkte i teksten, og 1 hvor barnet skal slutte sig til svaret (læse mellem linjerne)."
+      : "Lav præcis 3 spørgsmål, hvor svaret kan findes direkte i teksten.";
+    var user="Lav en kort, hyggelig dansk tekst ("+sværhed+") der passer til niveauet \""+cfg.name+"\""
+      +" om et hverdagsemne (dyr, leg, natur, familie, skole). "+spørgsmålstype+"\n"
       +"Returnér JSON: { \"tekst\": \"...\", \"spoergsmaal\": [ { \"q\":\"spørgsmål\", \"svar\":\"kort facit\" } ] }";
     return callGemini(sys,user).then(function(j){
       if(!j||!j.tekst||!Array.isArray(j.spoergsmaal)) throw {kind:"badshape"};
@@ -932,6 +1135,13 @@
     if(nav.screen==="ai-tutor") return renderAITutor();
     if(nav.screen==="promptlab") return renderPromptlab();
     if(nav.screen==="blandet") return renderBlandet();
+    if(nav.screen==="mere-menu") return renderMereMenu();
+    if(nav.screen==="english") return renderEnglishMenu();
+    if(nav.screen==="en-gloser") return renderEnglishGloser();
+    if(nav.screen==="en-lyt") return renderEnglishLyt();
+    if(nav.screen==="klokken") return renderKlokken();
+    if(nav.screen==="penge") return renderPenge();
+    if(nav.screen==="overblik") return renderOverblik();
     if(nav.screen==="fremskridt") return renderFremskridt();
     renderHome();
   }
@@ -968,17 +1178,41 @@
       '<div class="bar"><i style="width:'+info.pct+'%;background:linear-gradient(90deg,var(--neon),#fff7c2)"></i></div>';
     app.appendChild(lvl);
 
+    // gentle global streak (any subject) — weekend-lenient, no pressure language
+    var gs=globalStreak(kid);
+    var sb=el("div",null, gs>0
+      ? '<span style="font-size:18px">🔥</span> '+gs+' dag'+(gs===1?'':'e')+' i træk — bliv ved i dit eget tempo'
+      : '<span style="font-size:18px">🌱</span> Ny dag — øv lidt, når I har lyst');
+    sb.style.cssText="margin:0 0 14px;padding:11px 14px;border-radius:14px;border:1px solid var(--line);background:var(--card);font-family:'Nunito';font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px";
+    app.appendChild(sb);
+
     // tiles: Mål (Måltavle) + subjects + daily mixed challenge
     var tiles=el("div","tiles");
     tiles.appendChild(goalTile(kid));
     tiles.appendChild(subjectTile(kid,"reading","🔤","Læsning","Ordkort · forståelse · højtlæsning","var(--read)",function(){ go("reading-menu"); }));
     tiles.appendChild(subjectTile(kid,"math","🧮","Matematik","Talfakta · tabel-spil","var(--math)",function(){ go("math-menu"); }));
     tiles.appendChild(subjectTile(kid,"ai","🤖","AI-forståelse","Hvordan virker AI · tutor · prompt-lab","var(--ai)",function(){ go("ai-menu"); }));
+    tiles.appendChild(subjectTile(kid,"english","🇬🇧","English","Gloser · lyt og skriv","#5B9DFF",function(){ go("english"); }));
     tiles.appendChild(subjectTile(kid,"daily","🎲","Daglig udfordring","Lidt fra det hele — blandet","var(--c2)",function(){ go("blandet"); }));
+    tiles.appendChild(subjectTile(kid,"mere","🕐","Klokken & penge","Lær klokken og tæl kroner","#FF9F45",function(){ go("mere-menu"); }));
     app.appendChild(tiles);
 
     // supervise note
     app.appendChild(el("div","supervise",'<span class="se">👀</span><p>AI-hjælperen er en støtte, ikke en lærer. Brug appen sammen med dit barn — især den yngste — og snak om svarene undervejs.</p>'));
+
+    // backup reminder (Safari can clear local data after ~7 days; one tap to save a file)
+    if(backupOverdue()){
+      var bk=el("div"); bk.style.cssText="margin-top:14px;padding:12px 14px;border-radius:14px;border:1px solid color-mix(in srgb,var(--neon) 40%, var(--line));background:color-mix(in srgb,var(--neon) 8%, var(--card));display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      bk.appendChild(el("div",null,'<span style="font-size:17px">💾</span> <span style="font-family:\'Nunito\';font-weight:700;font-size:13.5px">Husk en backup, så I ikke mister fremgang.</span>'));
+      var bkb=el("button",null,"Gem backup"); bkb.style.cssText="margin-left:auto;border:none;border-radius:11px;padding:9px 14px;font-family:'Fredoka';font-weight:600;font-size:13px;background:var(--neon);color:#1a1700;cursor:pointer";
+      bkb.onclick=function(){ doBackup(); render(); };
+      bk.appendChild(bkb); app.appendChild(bk);
+    }
+
+    var plink=el("button","linkbtn","📊 Forælder-overblik");
+    plink.style.cssText="display:block;margin:14px auto 0;color:var(--mut)";
+    plink.onclick=function(){ go("overblik"); };
+    app.appendChild(plink);
   }
 
   function goalTile(kid){
@@ -1024,6 +1258,7 @@
     b.onclick=onclick; return b;
   }
   function renderReadingMenu(){
+    var kid=currentKid();
     app.appendChild(backbar("Læsning","Vælg en øvelse",function(){ go("home"); }));
     var p=el("div","panel");
     var first=menuBtn("🔤  Ordkort  (læs ordet)","var(--read)",function(){ go("ordkort"); }); first.style.marginTop="0";
@@ -1032,6 +1267,22 @@
     p.appendChild(menuBtn("⏱️  Højtlæsnings-timer  (ord/min)","var(--read)",function(){ go("hojtlaesning"); }));
     p.appendChild(menuBtn("✏️  Tilføj/ret ord","var(--read)",openWords,true));
     app.appendChild(p);
+
+    // adaptive reading level readout + parent manual override (mirrors Matematik)
+    var lp=el("div","panel"); lp.style.marginTop="14px";
+    var info=el("div","readingText"); info.style.fontSize="14.5px"; info.style.marginBottom="2px";
+    info.innerHTML="Niveau i forståelse: <b>"+esc(readStepName(kid))+"</b>";
+    lp.appendChild(info);
+    var sub=el("div","readingText"); sub.style.fontSize="12.5px"; sub.style.opacity=".75"; sub.style.marginTop="0";
+    sub.textContent="Tilpasser sig selv (trin "+(readStepOf(kid)+1)+" af "+(READ_STEP_MAX+1)+"). Forælder kan justere:";
+    lp.appendChild(sub);
+    var ctl=el("div"); ctl.style.cssText="display:flex;gap:10px;margin-top:8px";
+    var dn=el("button","linkbtn","▼ lidt lettere"); dn.style.color="var(--mut)";
+    dn.disabled=readStepOf(kid)<=0; dn.onclick=function(){ setReadStep(kid,readStepOf(kid)-1); };
+    var up=el("button","linkbtn","lidt sværere ▲"); up.style.color="var(--mut)";
+    up.disabled=readStepOf(kid)>=READ_STEP_MAX; up.onclick=function(){ setReadStep(kid,readStepOf(kid)+1); };
+    ctl.appendChild(dn); ctl.appendChild(up); lp.appendChild(ctl);
+    app.appendChild(lp);
   }
 
   function backbar(title,desc,onback){
@@ -1076,6 +1327,7 @@
         (session.sentence? '<div class="flashSentence">"'+esc(session.sentence)+'"</div>':'')+'</div>';
       card.onclick=function(){ session.phase="recall"; session.typed=""; session.recall=null; render(); };
       p.appendChild(card);
+      p.appendChild(speakBtn(w.word,"var(--read)"));
 
       // optional AI sentence (gives the word a little context)
       var sbtn=el("button","linkbtn","✨ Lav en sætning med ordet");
@@ -1189,6 +1441,7 @@
       var p=el("div","panel"); p.style.setProperty("--ac","var(--read)");
       if(data.ai) p.appendChild(aiTagRow());
       p.appendChild(el("div","readingText",esc(data.tekst)));
+      p.appendChild(speakBtn(data.tekst,"var(--read)"));
       var go2=el("button","bigbtn","Jeg har læst — videre til spørgsmål"); go2.style.setProperty("--ac","var(--read)");
       go2.onclick=function(){ session.state="quiz"; session.idx=0; render(); };
       p.appendChild(go2);
@@ -1224,9 +1477,13 @@
     if(session.state==="done"){ return forstDone(kid); }
   }
   function localText(kid){
-    var bank=levelOf(kid)==="adv"?TEXTS_ADVANCED:TEXTS_BEGINNER;
+    var cfg=readCfg(kid);
+    var bank=cfg.bank==="adv"?TEXTS_ADVANCED:TEXTS_BEGINNER;
     var t=bank[rnd(bank.length)];
-    return { tekst:t.tekst, ai:false, spoergsmaal:t.spoergsmaal.map(function(s){ return {q:s.q,a:s.a.map(function(x){return x.toLowerCase();})}; }) };
+    var qs=t.spoergsmaal.map(function(s){ return {q:s.q,a:s.a.map(function(x){return x.toLowerCase();})}; });
+    // at the top band, swap the last literal question for an inference one ("read between the lines")
+    if(cfg.inferens && t.inf){ qs[qs.length-1]={q:t.inf.q,a:t.inf.a.map(function(x){return x.toLowerCase();}),inf:true}; }
+    return { tekst:t.tekst, ai:false, spoergsmaal:qs };
   }
   function matchAnswer(given,accepted){
     var g=normWord(given);
@@ -1247,11 +1504,13 @@
   }
   function checkForst(kid,q,val,panel,isRetry){
     if(matchAnswer(val,q.a)){
+      if(!isRetry) logReadPerf(kid,true); // only the first attempt feeds the adaptive level
       session.fix=null; session.curAnswer=""; session.forstTries=0;
       session.idx++;
       if(session.idx>=session.data.spoergsmaal.length){ session.state="done"; }
       render(); return;
     }
+    if(!isRetry) logReadPerf(kid,false);
     session.forstTries=(session.forstTries||0)+1;
     var hasKey=!!(q.a&&q.a.length);
     var expected=hasKey?q.a[0]:null;
@@ -1269,11 +1528,14 @@
   }
   function forstDone(kid){
     markDone(kid,"reading"); award(kid,XP.moduleDone);
+    var levelChange=adjustReadStep(kid); save(); // controller: nudge reading difficulty toward ~85%
     app.appendChild(backbar("Forståelse","Færdig","",function(){}));
     var p=el("div","panel"); p.style.setProperty("--ac","var(--read)");
     var h=el("div","qbig"); h.style.fontSize="30px"; h.textContent="Du læste det hele! 📖"; p.appendChild(h);
     p.appendChild(el("p","readingText","Du svarede på alle spørgsmålene. At læse lidt hver dag gør dig en lille smule bedre hver gang."));
     p.appendChild(el("div","feedback ok","Læse-streak: "+streakOf(kid,"reading")+" 🔥"));
+    if(levelChange==="up"){ var lu=el("div","feedback ok"); lu.textContent="📚 Du er klar til lidt sværere tekster — nyt niveau: "+readStepName(kid)+"."; p.appendChild(lu); }
+    else if(levelChange==="down"){ var ld=el("div","feedback"); ld.textContent="Vi tager lidt lettere tekster nu ("+readStepName(kid)+") — så følger du bedre med. 👍"; p.appendChild(ld); }
     doneCTA(p,{label:"Ny tekst", onclick:function(){ session=null; render(); }});
     app.appendChild(p); confetti();
   }
@@ -1284,7 +1546,13 @@
     var kid=currentKid();
     if(!session){
       var qs=[]; var prev=null;
-      for(var i=0;i<MATH_N;i++){ var t=genMath(mathStepOf(kid),prev); prev=t.prompt; qs.push(t); }
+      for(var i=0;i<MATH_N;i++){
+        var t=null;
+        // ~35% of questions are a previously-missed fact that's due to come back
+        if(dueHardFacts(kid).length && Math.random()<0.35) t=pickHardFact(kid);
+        if(!t || t.prompt===prev) t=genMath(mathStepOf(kid),prev);
+        prev=t.prompt; qs.push(t);
+      }
       session={ kind:"math", qs:qs, idx:0, correct:0, start:Date.now(), qStart:Date.now(), state:"ask", fix:null, fixTries:0, curAnswer:"" };
     }
     if(session.idx>=session.qs.length){ return mathDone(kid); }
@@ -1326,12 +1594,12 @@
     if(!val.toString().trim()||isNaN(v)) return;
     var ms=Math.max(300, Date.now()-(session.qStart||Date.now())); // first-attempt response time
     if(v===t.answer){
-      logMathPerf(kid,true,ms);
+      logMathPerf(kid,true,ms); easeHardFact(kid,t);
       session.correct++; award(kid,XP.correct);
       session.idx++; session.state="ask"; session.curAnswer=""; session.fix=null; session.fixTries=0; session.qStart=Date.now();
       render();
     } else {
-      logMathPerf(kid,false,ms);
+      logMathPerf(kid,false,ms); recordHardFact(kid,t);
       mathLoadingFix(kid,t,val,"Matematik","talfakta",function(){ session.state="fixing"; },"var(--math)");
     }
   }
@@ -1521,7 +1789,7 @@
   function renderHojtlaesning(){
     var kid=currentKid();
     if(!session){
-      var bank=levelOf(kid)==="adv"?READALOUD_ADVANCED:READALOUD_BEGINNER;
+      var bank=readCfg(kid).bank==="adv"?READALOUD_ADVANCED:READALOUD_BEGINNER;
       var text=bank[rnd(bank.length)];
       session={ kind:"wpm", text:text, words:text.trim().split(/\s+/).length, state:"ready", start:0, elapsed:0 };
     }
@@ -1646,8 +1914,8 @@
   }
   function tabSubmit(kid,t,val){
     var v=parseInt(val,10); if(!String(val).trim()||isNaN(v)) return;
-    if(v===t.answer){ session.correct++; award(kid,XP.correct); session.idx++; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); }
-    else { mathLoadingFix(kid,t,val,(typeof session.table==="number"?session.table+"-tabel":"Blandet tabel"),"tabel",function(){ session.state="fixing"; },"var(--math)"); }
+    if(v===t.answer){ easeHardFact(kid,t); session.correct++; award(kid,XP.correct); session.idx++; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); }
+    else { recordHardFact(kid,t); mathLoadingFix(kid,t,val,(typeof session.table==="number"?session.table+"-tabel":"Blandet tabel"),"tabel",function(){ session.state="fixing"; },"var(--math)"); }
   }
   function tabFix(kid,val){ genericFix(kid,val,function(){ session.idx++; session.state="play"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); }); }
   function tableDone(kid){
@@ -1866,8 +2134,8 @@
   function nextMix(){ session.idx++; session.state="ask"; session.curAnswer=""; session.fix=null; session.fixTries=0; render(); }
   function mixSubmitMath(kid,t,val){
     var v=parseInt(val,10); if(!String(val).trim()||isNaN(v)) return;
-    if(v===t.answer){ session.correct++; award(kid,XP.correct); nextMix(); }
-    else { mathLoadingFix(kid,t,val,"Daglig udfordring","blandet",function(){ session.state="fixing"; },"var(--c2)"); }
+    if(v===t.answer){ easeHardFact(kid,t); session.correct++; award(kid,XP.correct); nextMix(); }
+    else { recordHardFact(kid,t); mathLoadingFix(kid,t,val,"Daglig udfordring","blandet",function(){ session.state="fixing"; },"var(--c2)"); }
   }
   function blandetDone(kid){
     markDone(kid,"daily"); markDone(kid,"math"); markDone(kid,"reading"); award(kid,XP.moduleDone); save();
@@ -1919,6 +2187,325 @@
     app.appendChild(p);
   }
 
+  /* =====================================================================
+     FORÆLDER-OVERBLIK — parent-facing, cross-child, read-only.
+     Built entirely from local kid state; nothing leaves the device.
+     ===================================================================== */
+  function hardestWords(kid,max){
+    var ws=(kid.words||[]).slice().sort(function(a,b){
+      var ha=a.hard||0, hb=b.hard||0; if(hb!==ha) return hb-ha;
+      return (a.box||1)-(b.box||1);
+    });
+    var hard=ws.filter(function(w){ return (w.hard||0)>0; });
+    var list=(hard.length?hard:ws.filter(function(w){ return (w.box||1)<=1; })).slice(0,max||6);
+    return list;
+  }
+  function activeCount(kid,days){ var c=0; for(var i=0;i<days;i++){ if(activeOn(kid,dkey(addDays(today(),-i)))) c++; } return c; }
+  function renderOverblik(){
+    app.appendChild(backbar("Forælder-overblik","Sådan går det",function(){ go("home"); }));
+    state.kids.forEach(function(kid){
+      var p=el("div","panel"); p.style.marginBottom="14px"; p.style.setProperty("--ac",kid.color);
+      var head=el("div"); head.style.cssText="display:flex;align-items:center;gap:10px;margin-bottom:10px";
+      head.innerHTML='<div style="width:34px;height:34px;border-radius:10px;display:grid;place-items:center;font-size:19px;background:color-mix(in srgb,'+kid.color+' 20%,transparent);border:1.5px solid color-mix(in srgb,'+kid.color+' 45%,transparent)">'+kid.emoji+'</div>'
+        +'<div style="font-family:\'Fredoka\';font-weight:600;font-size:18px">'+esc(kid.name)+'</div>';
+      p.appendChild(head);
+
+      var info=levelInfo(kid.xp||0);
+      var rows=el("div"); rows.style.cssText="font-family:'Nunito';font-size:14.5px;line-height:1.9";
+      rows.innerHTML=
+        '🧮 <b>Matematik:</b> '+esc(mathStepName(kid))+' <span style="color:var(--mut)">(trin '+(mathStepOf(kid)+1)+'/'+(MATH_STEP_MAX+1)+')</span><br>'+
+        '📖 <b>Læsning:</b> '+esc(readStepName(kid))+' <span style="color:var(--mut)">(trin '+(readStepOf(kid)+1)+'/'+(READ_STEP_MAX+1)+')</span><br>'+
+        '⭐️ <b>Level '+info.level+'</b> · '+esc(levelTitle(info.level))+' · '+(kid.xp||0)+' XP';
+      p.appendChild(rows);
+
+      var grid=el("div","sumGrid"); grid.style.marginTop="12px";
+      grid.innerHTML=
+        '<div class="sumStat"><div class="v" style="color:var(--neon)">'+globalStreak(kid)+' 🔥</div><div class="k">Dage i træk</div></div>'+
+        '<div class="sumStat"><div class="v">'+activeCount(kid,14)+'/14</div><div class="k">Aktive dage</div></div>'+
+        '<div class="sumStat"><div class="v" style="color:var(--math)">'+Object.keys(kid.tables||{}).length+'</div><div class="k">Tabeller</div></div>';
+      p.appendChild(grid);
+      var grid2=el("div","sumGrid"); grid2.style.marginTop="8px";
+      grid2.innerHTML=
+        '<div class="sumStat"><div class="v" style="color:var(--read)">'+streakOf(kid,"reading")+'</div><div class="k">Læse-streak</div></div>'+
+        '<div class="sumStat"><div class="v" style="color:var(--math)">'+streakOf(kid,"math")+'</div><div class="k">Regne-streak</div></div>'+
+        '<div class="sumStat"><div class="v" style="color:var(--neon)">'+(kid.wpmBest||0)+'</div><div class="k">Bedste o/m</div></div>';
+      p.appendChild(grid2);
+
+      var hw=hardestWords(kid,6);
+      var hwrap=el("div"); hwrap.style.marginTop="12px";
+      hwrap.appendChild(el("div","readingText",'<b>Sværeste ord lige nu:</b>'));
+      if(hw.length){
+        var chips=el("div"); chips.style.cssText="display:flex;flex-wrap:wrap;gap:7px;margin-top:6px";
+        hw.forEach(function(w){
+          var c=el("div",null,esc(w.word)+((w.hard||0)>0?' <span style="color:var(--mut)">×'+w.hard+'</span>':''));
+          c.style.cssText="border:1px solid var(--line);border-radius:10px;padding:6px 10px;font-family:'Nunito';font-weight:700;font-size:13px;background:var(--bg2)";
+          chips.appendChild(c);
+        });
+        hwrap.appendChild(chips);
+      } else { hwrap.appendChild(el("div","readingText",'Ingen svære ord registreret endnu — godt tegn. 🙂')); }
+      p.appendChild(hwrap);
+
+      var hf=hardestFacts(kid,6);
+      if(hf.length){
+        var mwrap=el("div"); mwrap.style.marginTop="12px";
+        mwrap.appendChild(el("div","readingText",'<b>Sværeste regnestykker:</b>'));
+        var mchips=el("div"); mchips.style.cssText="display:flex;flex-wrap:wrap;gap:7px;margin-top:6px";
+        hf.forEach(function(f){
+          var c=el("div",null,esc(f.prompt)+' <span style="color:var(--mut)">×'+(f.miss||1)+'</span>');
+          c.style.cssText="border:1px solid var(--line);border-radius:10px;padding:6px 10px;font-family:'Nunito';font-weight:700;font-size:13px;background:var(--bg2)";
+          mchips.appendChild(c);
+        });
+        mwrap.appendChild(mchips); p.appendChild(mwrap);
+      }
+      app.appendChild(p);
+    });
+    app.appendChild(el("div","supervise",'<span class="se">🔒</span><p>Alt her ligger kun på denne enhed. Niveauerne tilpasser sig selv, men du kan altid justere dem manuelt under hvert fag.</p>'));
+  }
+
+  /* =====================================================================
+     MERE: nye færdigheder — KLOKKEN + PENGE (same engine: ask → gentle fix → done)
+     ===================================================================== */
+  function renderMereMenu(){
+    var kid=currentKid();
+    app.appendChild(backbar("Mere","Flere færdigheder",function(){ go("home"); }));
+    var p=el("div","panel");
+    var b1=menuBtn("🕐  Klokken  (hvad er klokken?)","#FF9F45",function(){ go("klokken"); }); b1.style.marginTop="0";
+    p.appendChild(b1);
+    var cl=el("div","readingText"); cl.style.cssText="font-size:12.5px;opacity:.75;margin:2px 0 0 2px";
+    cl.textContent="Klokke-niveau: "+clockStepName(kid)+" (tilpasser sig selv)";
+    p.appendChild(cl);
+    p.appendChild(menuBtn("🪙  Penge  (tæl kronerne)","#FF9F45",function(){ go("penge"); }));
+    app.appendChild(p);
+  }
+
+  function fmtTime(h,m){ return h+":"+(m<10?"0"+m:m); }
+  function clockSVG(h,m){
+    var cx=100,cy=100,r=94;
+    var mAng=(m/60)*360, hAng=((h%12)/12)*360+(m/60)*30;
+    function hand(ang,len,w,col){ var rad=(ang-90)*Math.PI/180; return '<line x1="100" y1="100" x2="'+(cx+Math.cos(rad)*len).toFixed(1)+'" y2="'+(cy+Math.sin(rad)*len).toFixed(1)+'" stroke="'+col+'" stroke-width="'+w+'" stroke-linecap="round"/>'; }
+    var ticks="",nums="";
+    for(var i=0;i<12;i++){ var a=(i/12)*360-90,rad=a*Math.PI/180;
+      ticks+='<line x1="'+(cx+Math.cos(rad)*(r-7)).toFixed(1)+'" y1="'+(cy+Math.sin(rad)*(r-7)).toFixed(1)+'" x2="'+(cx+Math.cos(rad)*r).toFixed(1)+'" y2="'+(cy+Math.sin(rad)*r).toFixed(1)+'" stroke="var(--mut)" stroke-width="3"/>'; }
+    for(var n=1;n<=12;n++){ var a2=(n/12)*360-90,rad2=a2*Math.PI/180;
+      nums+='<text x="'+(cx+Math.cos(rad2)*(r-20)).toFixed(1)+'" y="'+(cy+Math.sin(rad2)*(r-20)+6).toFixed(1)+'" text-anchor="middle" font-size="17" font-family="Fredoka" font-weight="600" fill="var(--ink)">'+n+'</text>'; }
+    return '<svg width="210" height="210" viewBox="0 0 200 200" style="display:block;margin:8px auto">'
+      +'<circle cx="100" cy="100" r="96" fill="var(--bg2)" stroke="var(--line)" stroke-width="2"/>'
+      +ticks+nums+hand(hAng,50,6,"var(--read)")+hand(mAng,74,4,"var(--math)")
+      +'<circle cx="100" cy="100" r="5.5" fill="var(--ink)"/></svg>';
+  }
+  function genClock(step){
+    var cfg=CLOCK_STEPS[Math.max(0,Math.min(CLOCK_STEP_MAX,step||0))];
+    var h=1+rnd(12), m=cfg.mins[rnd(cfg.mins.length)];
+    var correct=fmtTime(h,m);
+    var opts={}; opts[correct]=true;
+    var pool=cfg.mins.length>1?cfg.mins:[0,15,30,45]; // plausible distractor minutes
+    var guard=0;
+    while(Object.keys(opts).length<4 && guard++<60){
+      var dh=h, dm=m;
+      if(rnd(2)===0) dh=1+rnd(12); else dm=pool[rnd(pool.length)];
+      opts[fmtTime(dh,dm)]=true;
+    }
+    var arr=Object.keys(opts); arr.sort(function(){ return Math.random()-0.5; });
+    return { h:h, m:m, correct:correct, opts:arr };
+  }
+  function renderKlokken(){
+    var kid=currentKid();
+    if(!session){ var qs=[]; var cs=clockStepOf(kid); for(var i=0;i<6;i++) qs.push(genClock(cs)); session={ kind:"klokke", qs:qs, idx:0, correct:0, tries:0, reveal:false, hint:false }; }
+    if(session.idx>=session.qs.length) return mereDone(kid,"Klokken","🕐");
+    var q=session.qs[session.idx];
+    app.appendChild(backbar("Klokken","Opgave "+(session.idx+1)+" af "+session.qs.length,function(){ go("mere-menu"); }));
+    var p=el("div","panel"); p.style.setProperty("--ac","#FF9F45");
+    p.appendChild(progressStrip(session.idx,session.qs.length,"#FF9F45"));
+    p.appendChild(el("div","answerText",'<b>Hvad er klokken?</b>'));
+    var clock=el("div",null,clockSVG(q.h,q.m)); p.appendChild(clock);
+    if(session.hint){ p.appendChild(el("div","fixHint",'Den korte viser peger på timen (den lille). Den lange viser peger på minutterne.')); }
+    var grid=el("div","tableGrid");
+    q.opts.forEach(function(opt){
+      var b=el("button","tableBtn",opt);
+      if(session.reveal && opt===q.correct){ b.style.borderColor="var(--green)"; b.style.color="var(--green)"; }
+      b.onclick=function(){
+        if(session.reveal) return;
+        if(opt===q.correct){ logClockPerf(kid,true); session.correct++; award(kid,XP.correct); session.idx++; session.tries=0; session.hint=false; session.reveal=false; render(); }
+        else {
+          if(session.tries===0) logClockPerf(kid,false); // first miss feeds the controller
+          session.tries++;
+          if(session.tries>=2){ session.reveal=true; } else { session.hint=true; }
+          render();
+        }
+      };
+      grid.appendChild(b);
+    });
+    p.appendChild(grid);
+    if(session.reveal){
+      p.appendChild(el("div","feedback","Klokken er "+q.correct+". Det er okay — kig på viserne og gå videre. 👍"));
+      var nx=el("button","bigbtn green","Videre"); nx.onclick=function(){ session.idx++; session.tries=0; session.hint=false; session.reveal=false; render(); };
+      p.appendChild(nx);
+    }
+    app.appendChild(p);
+  }
+
+  var COINS=[1,2,5,10,20];
+  function genMoney(){
+    var n=2+rnd(4), coins=[], sum=0;
+    for(var i=0;i<n;i++){ var c=COINS[rnd(COINS.length)]; coins.push(c); sum+=c; }
+    coins.sort(function(a,b){ return b-a; });
+    return { coins:coins, sum:sum };
+  }
+  function renderPenge(){
+    var kid=currentKid();
+    if(!session){ var qs=[]; for(var i=0;i<6;i++) qs.push(genMoney()); session={ kind:"penge", qs:qs, idx:0, correct:0, tries:0, reveal:false, hint:false, curAnswer:"" }; }
+    if(session.idx>=session.qs.length) return mereDone(kid,"Penge","🪙");
+    var q=session.qs[session.idx];
+    app.appendChild(backbar("Penge","Opgave "+(session.idx+1)+" af "+session.qs.length,function(){ go("mere-menu"); }));
+    var p=el("div","panel"); p.style.setProperty("--ac","#FF9F45");
+    p.appendChild(progressStrip(session.idx,session.qs.length,"#FF9F45"));
+    p.appendChild(el("div","answerText",'<b>Hvor mange kroner er der i alt?</b>'));
+    var row=el("div"); row.style.cssText="display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin:14px 0";
+    q.coins.forEach(function(c){
+      var coin=el("div",null,'🪙<br>'+c+' kr');
+      coin.style.cssText="width:64px;height:64px;border-radius:50%;display:grid;place-items:center;text-align:center;line-height:1.05;font-family:'Fredoka';font-weight:600;font-size:13px;background:color-mix(in srgb,#FF9F45 18%, var(--bg2));border:2px solid color-mix(in srgb,#FF9F45 55%, var(--line));color:var(--ink)";
+      row.appendChild(coin);
+    });
+    p.appendChild(row);
+    if(session.hint){ p.appendChild(el("div","fixHint",'Tæl mønterne sammen én ad gangen. Læg de store sammen først.')); }
+    if(session.reveal){
+      p.appendChild(el("div","feedback","Det er "+q.sum+" kr i alt. Tæl med en voksen og gå videre. 👍"));
+      var nx=el("button","bigbtn green","Videre"); nx.onclick=function(){ session.idx++; session.tries=0; session.hint=false; session.reveal=false; session.curAnswer=""; render(); };
+      p.appendChild(nx); app.appendChild(p); return;
+    }
+    var inp=el("input","answerIn"); inp.setAttribute("inputmode","numeric"); inp.value=session.curAnswer||""; inp.style.setProperty("--ac","#FF9F45");
+    inp.oninput=function(){ session.curAnswer=inp.value; };
+    inp.onkeydown=function(e){ if(e.key==="Enter") pengeSubmit(kid,q,inp.value); };
+    p.appendChild(inp);
+    var b=el("button","bigbtn","Svar"); b.style.setProperty("--ac","#FF9F45"); b.onclick=function(){ pengeSubmit(kid,q,inp.value); };
+    p.appendChild(b); app.appendChild(p); setTimeout(function(){ inp.focus(); },50);
+  }
+  function pengeSubmit(kid,q,val){
+    var v=parseInt(val,10); if(!String(val).trim()||isNaN(v)) return;
+    if(v===q.sum){ session.correct++; award(kid,XP.correct); session.idx++; session.tries=0; session.hint=false; session.curAnswer=""; render(); }
+    else { session.tries++; if(session.tries>=2) session.reveal=true; else session.hint=true; render(); }
+  }
+  function mereDone(kid,label,icon){
+    var clockMsg=null;
+    if(session && session.kind==="klokke"){ clockMsg=adjustClockStep(kid); save(); }
+    markDone(kid,"mere"); award(kid,XP.moduleDone);
+    app.appendChild(backbar(label,"Færdig","",function(){}));
+    var p=el("div","panel"); p.style.setProperty("--ac","#FF9F45");
+    var h=el("div","qbig"); h.style.fontSize="30px"; h.textContent="Godt øvet! "+icon; p.appendChild(h);
+    var grid=el("div","sumGrid");
+    grid.innerHTML='<div class="sumStat"><div class="v" style="color:var(--green)">'+session.correct+'/'+session.qs.length+'</div><div class="k">Rigtige</div></div>'+
+      '<div class="sumStat"><div class="v" style="color:var(--neon)">'+streakOf(kid,"mere")+' 🔥</div><div class="k">Streak</div></div>';
+    p.appendChild(grid);
+    p.appendChild(el("p","readingText","Du blev ved hele vejen. Lidt øvelse hver dag gør det nemt."));
+    if(clockMsg==="up"){ var lu=el("div","feedback ok"); lu.textContent="⏰ Du er klar til sværere klokkeslæt — nu: "+clockStepName(kid)+"."; p.appendChild(lu); }
+    else if(clockMsg==="down"){ var ld=el("div","feedback"); ld.textContent="Vi øver lidt lettere klokkeslæt nu ("+clockStepName(kid)+"). 👍"; p.appendChild(ld); }
+    doneCTA(p,{label:"En gang til", onclick:function(){ session=null; render(); }});
+    app.appendChild(p); confetti();
+  }
+
+  /* =====================================================================
+     ENGELSK — vocabulary on the SRS engine + a listen-and-type (dictation) mode
+     ===================================================================== */
+  function renderEnglishMenu(){
+    var kid=currentKid();
+    app.appendChild(backbar("English","Vælg en øvelse",function(){ go("home"); }));
+    var p=el("div","panel");
+    var b1=menuBtn("🇬🇧  Gloser  (hvad betyder ordet?)","var(--ai)",function(){ go("en-gloser"); }); b1.style.marginTop="0";
+    p.appendChild(b1);
+    if(canSpeak()){
+      p.appendChild(menuBtn("👂  Lyt og skriv  (hør & stav)","var(--ai)",function(){ go("en-lyt"); }));
+    } else {
+      var note=el("div","readingText"); note.style.cssText="font-size:13px;opacity:.7;margin-top:12px";
+      note.textContent="“Lyt og skriv” kræver, at enheden kan læse op. Slå en engelsk stemme til under iPad'ens Tilgængelighed.";
+      p.appendChild(note);
+    }
+    app.appendChild(p);
+  }
+  function enQueue(kid){ var due=enDue(kid); if(!due.length){ due=(kid.enWords||[]).slice().sort(function(a,b){ return (a.due<b.due?-1:1); }).slice(0,8); } return due.slice(0,12); }
+  function enGrade(typed,target){
+    var g=normWord(typed), t=normWord(target);
+    if(!g) return null;
+    if(g===t) return "good";
+    if(t.length>=3 && levenshtein(g,t)<=1) return "mid";
+    return "bad";
+  }
+
+  function renderEnglishGloser(){
+    var kid=currentKid();
+    if(!session){ var q=enQueue(kid); if(!q.length){ go("english"); return; } session={ kind:"engloser", queue:q, idx:0, total:q.length, typed:"", result:null }; }
+    if(session.idx>=session.queue.length) return englishDone(kid,"Gloser");
+    var w=session.queue[session.idx];
+    app.appendChild(backbar("English · Gloser","Ord "+(session.idx+1)+" af "+session.total,function(){ go("english"); }));
+    var p=el("div","panel"); p.style.setProperty("--ac","var(--ai)");
+    p.appendChild(progressStrip(session.idx,session.total,"var(--ai)"));
+    var card=el("div","flashcard"); card.style.setProperty("--ac","var(--ai)");
+    card.innerHTML='<div class="flashWord">'+esc(w.en)+'</div>';
+    p.appendChild(card);
+    p.appendChild(speakBtn(w.en,"var(--ai)","en-GB","🔊 Hør ordet"));
+    if(!session.result){
+      p.appendChild(el("div","answerText",'<b>Hvad betyder ordet på dansk?</b>'));
+      var inp=el("input","inp"); inp.placeholder="Skriv på dansk"; inp.value=session.typed||""; inp.style.fontSize="20px";
+      inp.setAttribute("autocapitalize","none"); inp.setAttribute("autocomplete","off"); inp.setAttribute("spellcheck","false");
+      inp.oninput=function(){ session.typed=inp.value; };
+      inp.onkeydown=function(e){ if(e.key==="Enter") checkEnGloser(kid,w,inp.value); };
+      p.appendChild(inp);
+      var chk=el("button","bigbtn","Tjek"); chk.style.setProperty("--ac","var(--ai)"); chk.onclick=function(){ checkEnGloser(kid,w,inp.value); };
+      p.appendChild(chk);
+      app.appendChild(p); setTimeout(function(){ inp.focus(); },50); return;
+    }
+    var r=session.result;
+    var fb=el("div","feedback "+(r==="good"?"ok":r==="bad"?"no":"")); fb.textContent=r==="good"?"Rigtigt! ✓":r==="mid"?"Næsten — godt forsøg":"Ikke helt — øv den igen"; p.appendChild(fb);
+    if(r!=="good"){ var h=el("div","fixHint"); h.innerHTML='“'+esc(w.en)+'” betyder <b>'+esc(w.da)+'</b>'; p.appendChild(h); }
+    var nx=el("button","bigbtn green","Videre"); nx.onclick=function(){ enNext(kid,w,r); }; p.appendChild(nx);
+    app.appendChild(p);
+  }
+  function checkEnGloser(kid,w,val){ var r=enGrade(val,w.da); if(!r) return; session.result=r; render(); }
+
+  function renderEnglishLyt(){
+    var kid=currentKid();
+    if(!session){ var q=enQueue(kid); if(!q.length){ go("english"); return; } session={ kind:"enlyt", queue:q, idx:0, total:q.length, typed:"", result:null, played:false }; }
+    if(session.idx>=session.queue.length) return englishDone(kid,"Lyt og skriv");
+    var w=session.queue[session.idx];
+    app.appendChild(backbar("English · Lyt","Ord "+(session.idx+1)+" af "+session.total,function(){ go("english"); }));
+    var p=el("div","panel"); p.style.setProperty("--ac","var(--ai)");
+    p.appendChild(progressStrip(session.idx,session.total,"var(--ai)"));
+    p.appendChild(el("div","answerText",'<b>Hør ordet og skriv det på engelsk:</b>'));
+    var play=el("button","bigbtn","🔊 Hør ordet"); play.style.setProperty("--ac","var(--ai)");
+    play.onclick=function(){ speak(w.en,"en-GB"); }; p.appendChild(play);
+    if(!session.result){
+      var inp=el("input","inp"); inp.placeholder="Skriv ordet (engelsk)"; inp.value=session.typed||""; inp.style.fontSize="20px";
+      inp.setAttribute("autocapitalize","none"); inp.setAttribute("autocomplete","off"); inp.setAttribute("spellcheck","false");
+      inp.oninput=function(){ session.typed=inp.value; };
+      inp.onkeydown=function(e){ if(e.key==="Enter") checkEnLyt(kid,w,inp.value); };
+      p.appendChild(inp);
+      var chk=el("button","bigbtn","Tjek"); chk.style.setProperty("--ac","var(--ai)"); chk.style.marginTop="10px"; chk.onclick=function(){ checkEnLyt(kid,w,inp.value); };
+      p.appendChild(chk);
+      app.appendChild(p); setTimeout(function(){ speak(w.en,"en-GB"); var i=p.querySelector("input.inp"); if(i)i.focus(); },120); return;
+    }
+    var r=session.result;
+    var fb=el("div","feedback "+(r==="good"?"ok":r==="bad"?"no":"")); fb.textContent=r==="good"?"Rigtigt! ✓":r==="mid"?"Næsten — godt forsøg":"Ikke helt — øv den igen"; p.appendChild(fb);
+    if(r!=="good"){ var h=el("div","fixHint"); h.innerHTML='Ordet staves <b>'+esc(w.en)+'</b> ('+esc(w.da)+')'; p.appendChild(h); }
+    var nx=el("button","bigbtn green","Videre"); nx.onclick=function(){ enNext(kid,w,r); }; p.appendChild(nx);
+    app.appendChild(p);
+  }
+  function checkEnLyt(kid,w,val){ var r=enGrade(val,w.en); if(!r) return; session.result=r; render(); }
+
+  function enNext(kid,w,r){
+    gradeCard(w,r); award(kid,XP.card);
+    if(r==="bad") session.queue.push(w);
+    session.idx++; session.typed=""; session.result=null; session.played=false; render();
+  }
+  function englishDone(kid,label){
+    markDone(kid,"english"); award(kid,XP.moduleDone);
+    app.appendChild(backbar("English · "+label,"Færdig","",function(){}));
+    var p=el("div","panel"); p.style.setProperty("--ac","var(--ai)");
+    var h=el("div","qbig"); h.style.fontSize="30px"; h.textContent="Well done! 🇬🇧"; p.appendChild(h);
+    p.appendChild(el("p","readingText","Du øvede "+session.total+" engelske ord. De ord, der drillede, kommer igen senere."));
+    p.appendChild(el("div","feedback ok","English-streak: "+streakOf(kid,"english")+" 🔥"));
+    doneCTA(p,{label:"Flere ord", onclick:function(){ session=null; render(); }});
+    app.appendChild(p); confetti();
+  }
+
   /* ---------- confetti ---------- */
   function confetti(){
     var cols=["#FFE94D","#2DD4E8","#FF5C8A","#34D399","#A78BFA","#FF9F45"];
@@ -1941,6 +2528,10 @@
     document.getElementById("setModel").value=state.settings.model||"gemini-2.5-flash";
     document.getElementById("setLog").value=state.settings.logUrl||"";
     document.getElementById("setLogNames").checked=!!state.settings.logNames;
+    document.getElementById("setReadFriendly").checked=!!state.settings.readfriendly;
+    document.getElementById("setBigText").checked=!!state.settings.bigtext;
+    document.getElementById("backupStatus").innerHTML = state.settings.lastBackup
+      ? 'Seneste backup: '+esc(state.settings.lastBackup) : '<span class="statusNo">● Ingen backup taget endnu</span>';
     document.getElementById("logStatus").innerHTML=state.settings.logUrl
       ? '<span class="statusOk">● Dataopsamling slået til</span>' : '<span class="statusNo">● Slået fra (intet sendes)</span>';
     document.getElementById("keyStatus").innerHTML = state.settings.apiKey
@@ -1953,7 +2544,9 @@
     state.settings.model=document.getElementById("setModel").value.trim()||"gemini-2.5-flash";
     state.settings.logUrl=document.getElementById("setLog").value.trim();
     state.settings.logNames=document.getElementById("setLogNames").checked;
-    save(); openSettings(); render();
+    state.settings.readfriendly=document.getElementById("setReadFriendly").checked;
+    state.settings.bigtext=document.getElementById("setBigText").checked;
+    save(); applyA11y(); openSettings(); render();
   };
   document.getElementById("logTest").onclick=function(){
     var url=document.getElementById("setLog").value.trim();
@@ -1967,12 +2560,7 @@
     if(confirm("Nulstil ALT? Alle børn, ord og fremskridt slettes. Lav evt. backup først.")){
       state=defaultState(); save(); hide("setScrim"); go("home"); }
   };
-  document.getElementById("exportBtn").onclick=function(){
-    var blob=new Blob([JSON.stringify(state,null,2)],{type:"application/json"});
-    var url=URL.createObjectURL(blob),a=document.createElement("a");
-    a.href=url; a.download="laering-backup-"+todayKey()+".json"; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function(){URL.revokeObjectURL(url);},1000);
-  };
+  document.getElementById("exportBtn").onclick=function(){ doBackup(); openSettings(); };
   document.getElementById("importBtn").onclick=function(){ document.getElementById("importFile").click(); };
   document.getElementById("importFile").onchange=function(ev){
     var f=ev.target.files[0]; if(!f) return; var r=new FileReader();
@@ -2018,7 +2606,7 @@
     var name=document.getElementById("kName").value.trim();
     var age=document.getElementById("kAge").value.trim();
     if(kidEditId){ var kid=findKid(kidEditId); if(name)kid.name=name; kid.age=age; kid.emoji=pickEmoji; kid.color=pickColor; }
-    else { var k=blankKid(name||("Barn "+(state.kids.length+1)),age,pickColor,pickEmoji); seedWords(k); state.kids.push(k); state.currentKid=k.id; }
+    else { var k=blankKid(name||("Barn "+(state.kids.length+1)),age,pickColor,pickEmoji); seedWords(k); seedEnWords(k); state.kids.push(k); state.currentKid=k.id; }
     save(); hide("kidScrim"); renderKidAdmin(); render();
   };
   document.getElementById("kidCancel").onclick=function(){ hide("kidScrim"); };
@@ -2075,6 +2663,7 @@
   };
 
   /* ---------- go ---------- */
+  applyA11y();
   render();
 })();
 </script>
